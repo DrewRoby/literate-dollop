@@ -1,0 +1,550 @@
+import streamlit as st
+import requests
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import networkx as nx
+from datetime import datetime
+import json
+
+# Page config
+st.set_page_config(
+    page_title="Data Catalog",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# API Configuration
+API_BASE_URL = st.secrets.get("API_BASE_URL", "http://localhost:8000")
+
+# Helper functions
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def search_catalog(query, type_filter=None, limit=50):
+    """Search the data catalog"""
+    params = {"q": query, "limit": limit}
+    if type_filter and type_filter != "All":
+        params["type_filter"] = type_filter.lower()
+    
+    try:
+        response = requests.get(f"{API_BASE_URL}/search", params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Search failed: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def get_table_details(database, schema, table):
+    """Get detailed information about a table"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/table/{database}/{schema}/{table}")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get table details: {e}")
+        return None
+
+@st.cache_data(ttl=300)
+def get_table_lineage(database, schema, table, depth=2):
+    """Get lineage graph for a table"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/lineage/{database}/{schema}/{table}",
+            params={"depth": depth}
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get lineage: {e}")
+        return None
+
+@st.cache_data(ttl=60)
+def get_catalog_stats():
+    """Get catalog statistics"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/stats")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get stats: {e}")
+        return {}
+
+@st.cache_data(ttl=300)
+def get_data_products():
+    """Get list of data products"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/data-products")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get data products: {e}")
+        return []
+
+def create_data_product(name, description, owner, tags, source_tables):
+    """Create a new data product"""
+    data = {
+        "name": name,
+        "description": description,
+        "owner": owner,
+        "tags": tags,
+        "source_tables": source_tables
+    }
+    
+    try:
+        response = requests.post(f"{API_BASE_URL}/data-products", json=data)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to create data product: {e}")
+        return None
+
+def refresh_schema():
+    """Trigger schema refresh"""
+    try:
+        response = requests.post(f"{API_BASE_URL}/refresh-schema")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to refresh schema: {e}")
+        return None
+
+def create_lineage_graph(lineage_data):
+    """Create interactive lineage graph using Plotly"""
+    if not lineage_data or not lineage_data.get("nodes"):
+        return go.Figure()
+    
+    # Create NetworkX graph for layout calculation
+    G = nx.DiGraph()
+    
+    # Add nodes
+    for node in lineage_data["nodes"]:
+        G.add_node(node["id"], **node["metadata"])
+    
+    # Add edges
+    for edge in lineage_data["edges"]:
+        G.add_edge(edge["source"], edge["target"], relationship=edge["relationship"])
+    
+    # Calculate layout
+    pos = nx.spring_layout(G, k=3, iterations=50)
+    
+    # Prepare data for Plotly
+    node_trace = go.Scatter(
+        x=[pos[node["id"]][0] for node in lineage_data["nodes"]],
+        y=[pos[node["id"]][1] for node in lineage_data["nodes"]],
+        mode='markers+text',
+        text=[node["name"] for node in lineage_data["nodes"]],
+        textposition="middle center",
+        marker=dict(
+            size=[30 if node["type"] == "table" else 20 for node in lineage_data["nodes"]],
+            color=[
+                "lightblue" if node["type"] == "table" else 
+                "lightgreen" if node["type"] == "view" else "lightgray"
+                for node in lineage_data["nodes"]
+            ],
+            line=dict(width=2, color="black")
+        ),
+        hovertemplate="<b>%{text}</b><br>Type: %{customdata}<extra></extra>",
+        customdata=[node["type"] for node in lineage_data["nodes"]],
+        name="Tables"
+    )
+    
+    edge_traces = []
+    for edge in lineage_data["edges"]:
+        x0, y0 = pos[edge["source"]]
+        x1, y1 = pos[edge["target"]]
+        
+        edge_trace = go.Scatter(
+            x=[x0, x1, None],
+            y=[y0, y1, None],
+            mode='lines',
+            line=dict(width=2, color="gray"),
+            showlegend=False,
+            hoverinfo='none'
+        )
+        edge_traces.append(edge_trace)
+    
+    # Create figure
+    fig = go.Figure(data=[node_trace] + edge_traces)
+    fig.update_layout(
+        title="Data Lineage Graph",
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(b=20,l=5,r=5,t=40),
+        annotations=[ 
+            dict(
+                text="Click and drag nodes to explore relationships",
+                showarrow=False,
+                xref="paper", yref="paper",
+                x=0.005, y=-0.002,
+                xanchor='left', yanchor='bottom',
+                font=dict(color="#888", size=12)
+            )
+        ],
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        plot_bgcolor='white'
+    )
+    
+    return fig
+
+# Main application
+def main():
+    st.title("🗃️ Data Catalog")
+    st.markdown("*Discover, explore, and manage your data ecosystem*")
+    
+    # Sidebar
+    st.sidebar.title("Navigation")
+    page = st.sidebar.selectbox(
+        "Choose a page",
+        ["🏠 Dashboard", "🔍 Search", "📊 Table Details", "🌐 Data Lineage", "📦 Data Products", "⚙️ Admin"]
+    )
+    
+    # Dashboard Page
+    if page == "🏠 Dashboard":
+        st.header("Dashboard")
+        
+        # Get stats
+        stats = get_catalog_stats()
+        
+        if stats:
+            # Metrics row
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("Databases", stats.get("databases", 0))
+            with col2:
+                st.metric("Schemas", stats.get("schemas", 0))
+            with col3:
+                st.metric("Tables", stats.get("tables", 0))
+            with col4:
+                st.metric("Columns", stats.get("columns", 0))
+            with col5:
+                st.metric("Data Products", stats.get("data_products", 0))
+            
+            st.markdown("---")
+        
+        # Recent activity and quick search
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader("Quick Search")
+            quick_search = st.text_input("Search tables, columns, or schemas...")
+            if quick_search:
+                results = search_catalog(quick_search, limit=10)
+                if results:
+                    for result in results[:5]:
+                        with st.expander(f"{result['name']} ({result['type']})"):
+                            st.write(f"**Path:** {result['path']}")
+                            if result.get('metadata'):
+                                st.json(result['metadata'])
+        
+        with col2:
+            st.subheader("Quick Actions")
+            if st.button("🔄 Refresh Schema", use_container_width=True):
+                with st.spinner("Refreshing schema..."):
+                    result = refresh_schema()
+                    if result:
+                        st.success("Schema refresh initiated!")
+                        st.cache_data.clear()
+            
+            if st.button("📦 Create Data Product", use_container_width=True):
+                st.session_state.page = "📦 Data Products"
+                st.rerun()
+    
+    # Search Page
+    elif page == "🔍 Search":
+        st.header("Search Data Catalog")
+        
+        col1, col2, col3 = st.columns([3, 1, 1])
+        
+        with col1:
+            search_query = st.text_input("Search query", placeholder="Enter table name, column name, or keyword...")
+        
+        with col2:
+            type_filter = st.selectbox(
+                "Filter by type",
+                ["All", "Database", "Schema", "Table", "Column"]
+            )
+        
+        with col3:
+            limit = st.number_input("Results limit", min_value=10, max_value=100, value=50)
+        
+        if search_query:
+            with st.spinner("Searching..."):
+                results = search_catalog(search_query, type_filter, limit)
+            
+            if results:
+                st.success(f"Found {len(results)} results")
+                
+                # Results table
+                df = pd.DataFrame([
+                    {
+                        "Name": r["name"],
+                        "Type": r["type"].title(),
+                        "Path": r["path"],
+                        "Metadata": len(r.get("metadata", {}))
+                    }
+                    for r in results
+                ])
+                
+                # Make table clickable
+                event = st.dataframe(
+                    df,
+                    use_container_width=True,
+                    on_select="rerun",
+                    selection_mode="single-row"
+                )
+                
+                # Handle row selection
+                if event.selection and event.selection.rows:
+                    selected_idx = event.selection.rows[0]
+                    selected_result = results[selected_idx]
+                    
+                    if selected_result["type"] == "table":
+                        path_parts = selected_result["path"].split(".")
+                        if len(path_parts) >= 3:
+                            st.session_state.selected_database = path_parts[0]
+                            st.session_state.selected_schema = path_parts[1]
+                            st.session_state.selected_table = path_parts[2]
+                            st.session_state.page = "📊 Table Details"
+                            st.rerun()
+            else:
+                st.info("No results found. Try a different search term.")
+    
+    # Table Details Page
+    elif page == "📊 Table Details":
+        st.header("Table Details")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            database = st.text_input(
+                "Database", 
+                value=st.session_state.get("selected_database", "")
+            )
+        with col2:
+            schema = st.text_input(
+                "Schema", 
+                value=st.session_state.get("selected_schema", "")
+            )
+        with col3:
+            table = st.text_input(
+                "Table", 
+                value=st.session_state.get("selected_table", "")
+            )
+        
+        if database and schema and table:
+            with st.spinner("Loading table details..."):
+                table_details = get_table_details(database, schema, table)
+            
+            if table_details:
+                # Table info
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Table Type", table_details["type"].title())
+                with col2:
+                    st.metric("Row Count", f"{table_details.get('row_count', 0):,}" if table_details.get('row_count') else "Unknown")
+                with col3:
+                    st.metric("Column Count", len(table_details.get("columns", [])))
+                
+                st.markdown("---")
+                
+                # Columns
+                if table_details.get("columns"):
+                    st.subheader("Columns")
+                    columns_df = pd.DataFrame(table_details["columns"])
+                    st.dataframe(columns_df, use_container_width=True)
+                
+                # Foreign Keys
+                if table_details.get("foreign_keys"):
+                    st.subheader("Foreign Key Relationships")
+                    fk_df = pd.DataFrame(table_details["foreign_keys"])
+                    st.dataframe(fk_df, use_container_width=True)
+                
+                # Referenced By
+                if table_details.get("referenced_by"):
+                    st.subheader("Referenced By")
+                    ref_df = pd.DataFrame(table_details["referenced_by"])
+                    st.dataframe(ref_df, use_container_width=True)
+                
+                # Data Products
+                if table_details.get("data_products"):
+                    st.subheader("Related Data Products")
+                    for dp in table_details["data_products"]:
+                        st.write(f"• {dp}")
+                
+                # Quick actions
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("View Lineage"):
+                        st.session_state.lineage_database = database
+                        st.session_state.lineage_schema = schema
+                        st.session_state.lineage_table = table
+                        st.session_state.page = "🌐 Data Lineage"
+                        st.rerun()
+                
+                with col2:
+                    if st.button("Create Data Product"):
+                        st.session_state.dp_source_tables = [f"{database}.{schema}.{table}"]
+                        st.session_state.page = "📦 Data Products"
+                        st.rerun()
+    
+    # Data Lineage Page  
+    elif page == "🌐 Data Lineage":
+        st.header("Data Lineage")
+        
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+        
+        with col1:
+            database = st.text_input(
+                "Database",
+                value=st.session_state.get("lineage_database", "")
+            )
+        with col2:
+            schema = st.text_input(
+                "Schema", 
+                value=st.session_state.get("lineage_schema", "")
+            )
+        with col3:
+            table = st.text_input(
+                "Table",
+                value=st.session_state.get("lineage_table", "")
+            )
+        with col4:
+            depth = st.selectbox("Depth", [1, 2, 3, 4, 5], index=1)
+        
+        if database and schema and table:
+            with st.spinner("Loading lineage..."):
+                lineage_data = get_table_lineage(database, schema, table, depth)
+            
+            if lineage_data and lineage_data.get("nodes"):
+                # Create and display graph
+                fig = create_lineage_graph(lineage_data)
+                st.plotly_chart(fig, use_container_width=True, height=600)
+                
+                # Lineage summary
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("Upstream Dependencies")
+                    upstream = [
+                        edge["source"] for edge in lineage_data.get("edges", [])
+                        if edge["target"] == f"Table_{table}"
+                    ]
+                    if upstream:
+                        for dep in upstream:
+                            st.write(f"• {dep.replace('Table_', '')}")
+                    else:
+                        st.info("No upstream dependencies found")
+                
+                with col2:
+                    st.subheader("Downstream Dependencies")
+                    downstream = [
+                        edge["target"] for edge in lineage_data.get("edges", [])
+                        if edge["source"] == f"Table_{table}"
+                    ]
+                    if downstream:
+                        for dep in downstream:
+                            st.write(f"• {dep.replace('Table_', '')}")
+                    else:
+                        st.info("No downstream dependencies found")
+            else:
+                st.info("No lineage data found for this table")
+    
+    # Data Products Page
+    elif page == "📦 Data Products":
+        st.header("Data Products")
+        
+        tab1, tab2 = st.tabs(["📋 View Products", "➕ Create Product"])
+        
+        with tab1:
+            data_products = get_data_products()
+            
+            if data_products:
+                for dp in data_products:
+                    with st.expander(f"📦 {dp['name']} (Owner: {dp['owner']})"):
+                        st.write(f"**Description:** {dp['description']}")
+                        
+                        if dp.get('tags'):
+                            st.write(f"**Tags:** {', '.join(dp['tags'])}")
+                        
+                        if dp.get('source_tables'):
+                            st.write("**Source Tables:**")
+                            for table in dp['source_tables']:
+                                st.write(f"• {table}")
+                        
+                        if dp.get('created_at'):
+                            st.write(f"**Created:** {dp['created_at']}")
+            else:
+                st.info("No data products found")
+        
+        with tab2:
+            with st.form("create_data_product"):
+                name = st.text_input("Product Name*")
+                description = st.text_area("Description*")
+                owner = st.text_input("Owner*")
+                tags_input = st.text_input("Tags (comma-separated)")
+                
+                # Source tables
+                st.subheader("Source Tables")
+                source_tables = st.text_area(
+                    "Source tables (one per line, format: database.schema.table)",
+                    value="\n".join(st.session_state.get("dp_source_tables", []))
+                )
+                
+                submitted = st.form_submit_button("Create Data Product")
+                
+                if submitted and name and description and owner:
+                    tags = [tag.strip() for tag in tags_input.split(",") if tag.strip()]
+                    tables = [table.strip() for table in source_tables.split("\n") if table.strip()]
+                    
+                    result = create_data_product(name, description, owner, tags, tables)
+                    if result:
+                        st.success(f"Data product '{name}' created successfully!")
+                        st.cache_data.clear()
+                        st.rerun()
+    
+    # Admin Page
+    elif page == "⚙️ Admin":
+        st.header("Administration")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Schema Management")
+            
+            if st.button("🔄 Refresh Schema Now"):
+                with st.spinner("Refreshing schema..."):
+                    result = refresh_schema()
+                    if result:
+                        st.success("Schema refresh initiated!")
+                        st.cache_data.clear()
+            
+            st.info("Schema is automatically refreshed daily at 2:00 AM")
+        
+        with col2:
+            st.subheader("Cache Management")
+            
+            if st.button("🗑️ Clear Cache"):
+                st.cache_data.clear()
+                st.success("Cache cleared!")
+        
+        # System status
+        st.subheader("System Status")
+        
+        try:
+            response = requests.get(f"{API_BASE_URL}/health")
+            if response.status_code == 200:
+                st.success("✅ API is healthy")
+                health_data = response.json()
+                st.json(health_data)
+            else:
+                st.error("❌ API is not responding correctly")
+        except:
+            st.error("❌ Cannot connect to API")
+
+if __name__ == "__main__":
+    main()
