@@ -338,12 +338,14 @@ def main():
         
         with col2:
             st.subheader("Quick Actions")
-            if st.button("🔄 Refresh Schema", width='stretch'):
-                with st.spinner("Refreshing schema..."):
-                    result = refresh_schema()
-                    if result:
-                        st.success("Schema refresh initiated!")
-                        st.cache_data.clear()
+            # NO NO NO NO NO NO NO (oh Mama Mia, Mama Mia, Mama Mia, let me go)
+            # if st.button("🔄 Refresh Schema", width='stretch'):
+            #     with st.spinner("Refreshing schema..."):
+            #         result = refresh_schema()
+            #         if result:
+            #             st.success("Schema refresh initiated!")
+            #             st.cache_data.clear()
+            # BEELZEBUB HAS A FUNCTION PUT ASIDE FOR ME, FOR ME, FOR MEEEEE
             
             if st.button("📦 Create Data Product", width='stretch'):
                 st.session_state.page = "📦 Data Products"
