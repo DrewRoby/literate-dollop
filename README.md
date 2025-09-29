@@ -1,15 +1,3 @@
-I have an MVP to deliver in a few days. I need to map out an entire data ecosystem, most of which is on Microsoft SQL Server. I need to get as far as I can towards building this into a repeatable system that can update automatically, and provides searchability by field, table, database, or column. I also need to be able to add a catalog of data products, and connect them to their source tables. I would like to build on a graph database, because of the nature of the information. I have access to any Python libraries that will be useful (DBT, DataKitchen, &c.). This can be built as a web application or in some other framework, but I would like it to have maximum interaction (clickability, &c).
-
-Please provide a few approaches that will maximize automatability (in refreshing schema data from SQL Server), searchability, and user-friendliness, while sticking with FOSS tools as much as possible.
-
-
-Things I Had To Run:
-  To start my Neo4j instance: 
-    docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/p4ssw3rd neo4j:5.13-community
-
-
-
-
 # Data Catalog MVP Setup Guide
 
 ## Overview
