@@ -138,6 +138,109 @@ async def refresh_schema(background_tasks: BackgroundTasks):
     background_tasks.add_task(refresh_schema_job)
     return {"message": "Schema refresh initiated"}
 
+@app.post("/refresh-schema/incremental")
+async def refresh_schema_incremental(
+    background_tasks: BackgroundTasks,
+    force_all: bool = Query(False, description="Force refresh all tables")
+):
+    """
+    Trigger incremental schema refresh - only updates tables that have changed
+    Set force_all=true to refresh everything regardless of change detection
+    """
+    async def incremental_refresh_job(force_all: bool):
+        try:
+            result = await schema_extractor.incremental_refresh(force_all=force_all)
+            print(f"Incremental refresh completed at {datetime.utcnow()}: {result}")
+        except Exception as e:
+            print(f"Incremental refresh failed: {e}")
+    
+    background_tasks.add_task(incremental_refresh_job, force_all)
+    return {
+        "message": "Incremental schema refresh initiated",
+        "force_all": force_all
+    }
+
+@app.post("/refresh-schema/database/{database}")
+async def refresh_database(
+    database: str,
+    background_tasks: BackgroundTasks
+):
+    """Trigger refresh for a specific database"""
+    async def database_refresh_job(database: str):
+        try:
+            result = await schema_extractor.refresh_specific_database(database)
+            print(f"Database refresh completed at {datetime.utcnow()}: {result}")
+        except Exception as e:
+            print(f"Database refresh failed: {e}")
+    
+    background_tasks.add_task(database_refresh_job, database)
+    return {"message": f"Database '{database}' refresh initiated"}
+
+@app.post("/refresh-schema/database/{database}/schema/{schema}")
+async def refresh_schema_specific(
+    database: str,
+    schema: str,
+    background_tasks: BackgroundTasks
+):
+    """Trigger refresh for a specific schema within a database"""
+    async def schema_refresh_job(database: str, schema: str):
+        try:
+            result = await schema_extractor.refresh_specific_schema(database, schema)
+            print(f"Schema refresh completed at {datetime.utcnow()}: {result}")
+        except Exception as e:
+            print(f"Schema refresh failed: {e}")
+    
+    background_tasks.add_task(schema_refresh_job, database, schema)
+    return {"message": f"Schema '{database}.{schema}' refresh initiated"}
+
+@app.post("/refresh-schema/database/{database}/schema/{schema}/table/{table}")
+async def refresh_table(
+    database: str,
+    schema: str,
+    table: str,
+    background_tasks: BackgroundTasks
+):
+    """Trigger refresh for a specific table"""
+    async def table_refresh_job(database: str, schema: str, table: str):
+        try:
+            result = await schema_extractor.refresh_specific_table(database, schema, table)
+            print(f"Table refresh completed at {datetime.utcnow()}: {result}")
+        except Exception as e:
+            print(f"Table refresh failed: {e}")
+    
+    background_tasks.add_task(table_refresh_job, database, schema, table)
+    return {"message": f"Table '{database}.{schema}.{table}' refresh initiated"}
+
+@app.get("/refresh-schema/check-changes")
+async def check_schema_changes(
+    database: Optional[str] = Query(None, description="Filter by database"),
+    schema: Optional[str] = Query(None, description="Filter by schema"),
+    table: Optional[str] = Query(None, description="Filter by table")
+):
+    """
+    Check which tables need refresh based on modification time
+    Can filter by database, schema, or table
+    """
+    try:
+        tables_status = await schema_extractor.get_tables_needing_refresh(
+            database=database,
+            schema=schema,
+            table=table
+        )
+        
+        needs_refresh = [t for t in tables_status if t["needs_refresh"]]
+        up_to_date = [t for t in tables_status if not t["needs_refresh"]]
+        
+        return {
+            "total_tables": len(tables_status),
+            "needs_refresh": len(needs_refresh),
+            "up_to_date": len(up_to_date),
+            "tables_needing_refresh": needs_refresh,
+            "tables_up_to_date": up_to_date
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to check schema changes: {str(e)}")
+
 @app.get("/databases", response_model=List[str])
 async def list_databases(session = Depends(get_neo4j_session)):
     """Get list of all databases"""
