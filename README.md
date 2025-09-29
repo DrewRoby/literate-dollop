@@ -50,6 +50,8 @@ mkdir -p app streamlit_app
 # mssql+pymssql://username:password@server_host:1433/database_name
 ```
 
+Add `.streamlit` directory to streamlit_app, and generate a `secrets.toml` file with the variables needed in the app's main.py
+
 ### 3. Launch Services
 
 ```bash

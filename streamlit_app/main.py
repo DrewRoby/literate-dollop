@@ -82,6 +82,39 @@ def get_data_products():
         st.error(f"Failed to get data products: {e}")
         return []
 
+@st.cache_data(ttl=300)
+def get_databases():
+    """Get list of all databases"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/databases")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get databases: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def get_schemas(database):
+    """Get list of schemas for a database"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/databases/{database}/schemas")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get schemas: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def get_tables(database, schema):
+    """Get list of tables for a database and schema"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/databases/{database}/schemas/{schema}/tables")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to get tables: {e}")
+        return []
+
 def create_data_product(name, description, owner, tags, source_tables):
     """Create a new data product"""
     data = {
@@ -89,7 +122,8 @@ def create_data_product(name, description, owner, tags, source_tables):
         "description": description,
         "owner": owner,
         "tags": tags,
-        "source_tables": source_tables
+        "source_tables": source_tables,
+
     }
     
     try:
@@ -242,14 +276,14 @@ def main():
         
         with col2:
             st.subheader("Quick Actions")
-            if st.button("🔄 Refresh Schema", use_container_width=True):
+            if st.button("🔄 Refresh Schema", width='stretch'):
                 with st.spinner("Refreshing schema..."):
                     result = refresh_schema()
                     if result:
                         st.success("Schema refresh initiated!")
                         st.cache_data.clear()
             
-            if st.button("📦 Create Data Product", use_container_width=True):
+            if st.button("📦 Create Data Product", width='stretch'):
                 st.session_state.page = "📦 Data Products"
                 st.rerun()
     
@@ -292,7 +326,7 @@ def main():
                 # Make table clickable
                 event = st.dataframe(
                     df,
-                    use_container_width=True,
+                    width='stretch',
                     on_select="rerun",
                     selection_mode="single-row"
                 )
@@ -317,27 +351,109 @@ def main():
     elif page == "📊 Table Details":
         st.header("Table Details")
         
+        # Initialize session state for selections if not exists
+        if 'selected_database' not in st.session_state:
+            st.session_state.selected_database = None
+        if 'selected_schema' not in st.session_state:
+            st.session_state.selected_schema = None
+        if 'selected_table' not in st.session_state:
+            st.session_state.selected_table = None
+        
+        # Get list of databases
+        databases = get_databases()
+        
+        if not databases:
+            st.warning("No databases found. Please refresh the schema from the Admin page.")
+            return
+        
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            database = st.text_input(
-                "Database", 
-                value=st.session_state.get("selected_database", "")
+            # Database dropdown
+            database_index = 0
+            if st.session_state.selected_database and st.session_state.selected_database in databases:
+                database_index = databases.index(st.session_state.selected_database)
+            
+            selected_database = st.selectbox(
+                "Database",
+                options=databases,
+                index=database_index,
+                key="db_select"
             )
-        with col2:
-            schema = st.text_input(
-                "Schema", 
-                value=st.session_state.get("selected_schema", "")
-            )
-        with col3:
-            table = st.text_input(
-                "Table", 
-                value=st.session_state.get("selected_table", "")
-            )
+            
+            # Update session state if changed
+            if selected_database != st.session_state.selected_database:
+                st.session_state.selected_database = selected_database
+                st.session_state.selected_schema = None
+                st.session_state.selected_table = None
+                st.rerun()
         
-        if database and schema and table:
+        with col2:
+            # Schema dropdown
+            schemas = []
+            schema_index = 0
+            
+            if selected_database:
+                schemas = get_schemas(selected_database)
+                
+                if schemas:
+                    if st.session_state.selected_schema and st.session_state.selected_schema in schemas:
+                        schema_index = schemas.index(st.session_state.selected_schema)
+                    
+                    selected_schema = st.selectbox(
+                        "Schema",
+                        options=schemas,
+                        index=schema_index,
+                        key="schema_select"
+                    )
+                    
+                    # Update session state if changed
+                    if selected_schema != st.session_state.selected_schema:
+                        st.session_state.selected_schema = selected_schema
+                        st.session_state.selected_table = None
+                        st.rerun()
+                else:
+                    st.selectbox("Schema", options=[], disabled=True)
+                    selected_schema = None
+            else:
+                st.selectbox("Schema", options=[], disabled=True)
+                selected_schema = None
+        
+        with col3:
+            # Table dropdown
+            tables = []
+            table_index = 0
+            
+            if selected_database and selected_schema:
+                tables_data = get_tables(selected_database, selected_schema)
+                tables = [t["name"] for t in tables_data]
+                
+                if tables:
+                    if st.session_state.selected_table and st.session_state.selected_table in tables:
+                        table_index = tables.index(st.session_state.selected_table)
+                    
+                    selected_table = st.selectbox(
+                        "Table",
+                        options=tables,
+                        index=table_index,
+                        key="table_select"
+                    )
+                    
+                    # Update session state if changed
+                    if selected_table != st.session_state.selected_table:
+                        st.session_state.selected_table = selected_table
+                        st.rerun()
+                else:
+                    st.selectbox("Table", options=[], disabled=True)
+                    selected_table = None
+            else:
+                st.selectbox("Table", options=[], disabled=True)
+                selected_table = None
+        
+        # Display table details if all selections are made
+        if selected_database and selected_schema and selected_table:
             with st.spinner("Loading table details..."):
-                table_details = get_table_details(database, schema, table)
+                table_details = get_table_details(selected_database, selected_schema, selected_table)
             
             if table_details:
                 # Table info
@@ -356,19 +472,19 @@ def main():
                 if table_details.get("columns"):
                     st.subheader("Columns")
                     columns_df = pd.DataFrame(table_details["columns"])
-                    st.dataframe(columns_df, use_container_width=True)
+                    st.dataframe(columns_df, width='stretch')
                 
                 # Foreign Keys
                 if table_details.get("foreign_keys"):
                     st.subheader("Foreign Key Relationships")
                     fk_df = pd.DataFrame(table_details["foreign_keys"])
-                    st.dataframe(fk_df, use_container_width=True)
+                    st.dataframe(fk_df, width='stretch')
                 
                 # Referenced By
                 if table_details.get("referenced_by"):
                     st.subheader("Referenced By")
                     ref_df = pd.DataFrame(table_details["referenced_by"])
-                    st.dataframe(ref_df, use_container_width=True)
+                    st.dataframe(ref_df, width='stretch')
                 
                 # Data Products
                 if table_details.get("data_products"):
@@ -380,18 +496,20 @@ def main():
                 col1, col2 = st.columns(2)
                 with col1:
                     if st.button("View Lineage"):
-                        st.session_state.lineage_database = database
-                        st.session_state.lineage_schema = schema
-                        st.session_state.lineage_table = table
+                        st.session_state.lineage_database = selected_database
+                        st.session_state.lineage_schema = selected_schema
+                        st.session_state.lineage_table = selected_table
                         st.session_state.page = "🌐 Data Lineage"
                         st.rerun()
                 
                 with col2:
                     if st.button("Create Data Product"):
-                        st.session_state.dp_source_tables = [f"{database}.{schema}.{table}"]
+                        st.session_state.dp_source_tables = [f"{selected_database}.{selected_schema}.{selected_table}"]
                         st.session_state.page = "📦 Data Products"
                         st.rerun()
-    
+        else:
+            st.info("Please select a database, schema, and table to view details.")    
+
     # Data Lineage Page  
     elif page == "🌐 Data Lineage":
         st.header("Data Lineage")
@@ -423,7 +541,7 @@ def main():
             if lineage_data and lineage_data.get("nodes"):
                 # Create and display graph
                 fig = create_lineage_graph(lineage_data)
-                st.plotly_chart(fig, use_container_width=True, height=600)
+                st.plotly_chart(fig, width='stretch', height=600)
                 
                 # Lineage summary
                 col1, col2 = st.columns(2)
