@@ -10,8 +10,9 @@ import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# Import our schema extractor
+# Import our schema extractor and utilities
 from schema_extractor import SchemaExtractor
+from neo4j_utils import convert_neo4j_datetime, safe_get_datetime
 
 # Pydantic models
 class SearchResult(BaseModel):
@@ -41,6 +42,7 @@ class TableDetail(BaseModel):
     foreign_keys: List[Dict[str, Any]] = []
     referenced_by: List[Dict[str, Any]] = []
     data_products: List[str] = []
+    last_analyzed: Optional[datetime] = None
 
 class LineageNode(BaseModel):
     id: str
@@ -135,6 +137,54 @@ async def refresh_schema(background_tasks: BackgroundTasks):
     """Trigger manual schema refresh"""
     background_tasks.add_task(refresh_schema_job)
     return {"message": "Schema refresh initiated"}
+
+@app.get("/databases", response_model=List[str])
+async def list_databases(session = Depends(get_neo4j_session)):
+    """Get list of all databases"""
+    query = """
+    MATCH (db:Database)
+    RETURN db.name as name
+    ORDER BY db.name
+    """
+    
+    try:
+        result = session.run(query)
+        databases = [record["name"] for record in result]
+        return databases
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list databases: {str(e)}")
+
+@app.get("/databases/{database}/schemas", response_model=List[str])
+async def list_schemas(database: str, session = Depends(get_neo4j_session)):
+    """Get list of schemas for a specific database"""
+    query = """
+    MATCH (db:Database {name: $database})-[:CONTAINS]->(schema:Schema)
+    RETURN schema.name as name
+    ORDER BY schema.name
+    """
+    
+    try:
+        result = session.run(query, {"database": database})
+        schemas = [record["name"] for record in result]
+        return schemas
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list schemas: {str(e)}")
+
+@app.get("/databases/{database}/schemas/{schema}/tables", response_model=List[Dict[str, str]])
+async def list_tables(database: str, schema: str, session = Depends(get_neo4j_session)):
+    """Get list of tables for a specific database and schema"""
+    query = """
+    MATCH (db:Database {name: $database})-[:CONTAINS]->(s:Schema {name: $schema})-[:CONTAINS]->(t:Table)
+    RETURN t.name as name, t.type as type
+    ORDER BY t.name
+    """
+    
+    try:
+        result = session.run(query, {"database": database, "schema": schema})
+        tables = [{"name": record["name"], "type": record["type"]} for record in result]
+        return tables
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list tables: {str(e)}")
 
 @app.get("/search", response_model=List[SearchResult])
 async def search_catalog(
@@ -246,6 +296,9 @@ async def get_table_details(
         referenced_by = [{"table": ref} for ref in record["referenced_by"] if ref]
         data_products = record["data_products"]
         
+        # Convert last_analyzed datetime if present
+        last_analyzed = safe_get_datetime(table_node, "last_analyzed")
+        
         return TableDetail(
             name=table_node["name"],
             schema=schema,
@@ -255,7 +308,8 @@ async def get_table_details(
             columns=columns,
             foreign_keys=foreign_keys,
             referenced_by=referenced_by,
-            data_products=data_products
+            data_products=data_products,
+            last_analyzed=last_analyzed
         )
         
     except Exception as e:
@@ -424,7 +478,7 @@ async def create_data_product(
         return {"message": f"Data product '{record['name']}' created successfully"}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Well splunk my dunkus, we've got an error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create data product: {str(e)}")
 
 @app.get("/data-products", response_model=List[DataProduct])
 async def list_data_products(session = Depends(get_neo4j_session)):
@@ -448,14 +502,18 @@ async def list_data_products(session = Depends(get_neo4j_session)):
             dp_node = record["dp"]
             source_tables = [".".join(reversed(path)) for path in record["source_table_paths"] if path]
             
+            # Convert Neo4j DateTime to Python datetime if present
+            created_at = safe_get_datetime(dp_node, "created_at")
+            updated_at = safe_get_datetime(dp_node, "updated_at")
+            
             data_products.append(DataProduct(
                 name=dp_node["name"],
                 description=dp_node["description"],
                 owner=dp_node["owner"],
                 tags=dp_node.get("tags", []),
                 source_tables=source_tables,
-                created_at=dp_node.get("created_at"),
-                updated_at=dp_node.get("updated_at")
+                created_at=created_at,
+                updated_at=updated_at
             ))
         
         return data_products

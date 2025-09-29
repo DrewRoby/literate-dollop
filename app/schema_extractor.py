@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import hashlib
 
-from sqlalchemy import create_engine, MetaData, inspect
+from sqlalchemy import create_engine, MetaData, inspect, text
 from sqlalchemy.engine import Engine
 from neo4j import GraphDatabase
 import pymssql
@@ -31,20 +31,44 @@ class SchemaExtractor:
         # Get all databases (requires sysadmin rights or cross-db permissions)
         try:
             with self.sql_engine.connect() as conn:
-                databases_query = "SELECT name FROM sys.databases WHERE database_id > 4"  # Skip system DBs
+                # Use text() wrapper for raw SQL
+                databases_query = text("SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0")  # Skip system DBs and offline DBs
                 result = conn.execute(databases_query)
                 database_names = [row[0] for row in result]
+                logger.info(f"Found {len(database_names)} databases: {database_names}")
         except Exception as e:
             logger.warning(f"Could not get database list: {e}. Using current database only.")
-            database_names = [self.sql_engine.url.database or 'master']
+            # Get current database name from connection string
+            current_db = self.sql_engine.url.database
+            if current_db:
+                database_names = [current_db]
+            else:
+                # Try to get current database name
+                try:
+                    with self.sql_engine.connect() as conn:
+                        result = conn.execute(text("SELECT DB_NAME()"))
+                        current_db = result.scalar()
+                        database_names = [current_db] if current_db else ['master']
+                except:
+                    database_names = ['master']
         
+        # Process databases with better error handling
         for db_name in database_names:
-            db_schema = await self._extract_database_schema(db_name, inspector)
-            if db_schema:
-                schema_data['databases'].append(db_schema)
+            try:
+                logger.info(f"Processing database: {db_name}")
+                db_schema = await self._extract_database_schema(db_name, inspector)
+                if db_schema and db_schema.get('schemas'):
+                    schema_data['databases'].append(db_schema)
+                    logger.info(f"Successfully processed database {db_name} with {len(db_schema.get('schemas', []))} schemas")
+                else:
+                    logger.warning(f"No data extracted for database: {db_name}")
+            except Exception as e:
+                logger.error(f"Failed to process database {db_name}: {e}")
+                continue
         
         # Generate hash for change detection
         schema_data['schema_hash'] = self._generate_schema_hash(schema_data)
+        logger.info(f"Schema extraction completed. Total databases processed: {len(schema_data['databases'])}")
         return schema_data
     
     async def _extract_database_schema(self, db_name: str, inspector) -> Dict[str, Any]:
@@ -52,23 +76,49 @@ class SchemaExtractor:
         logger.info(f"Extracting schema for database: {db_name}")
         
         try:
-            # Switch to specific database
+            # Create new engine for specific database
             db_engine = create_engine(
-                self.sql_engine.url.set(database=db_name)
+                self.sql_engine.url.set(database=db_name),
+                pool_pre_ping=True,  # Verify connections before use
+                pool_recycle=3600    # Recycle connections after 1 hour
             )
+            
+            # Test connection
+            with db_engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            
             db_inspector = inspect(db_engine)
             
-            schemas = db_inspector.get_schema_names()
+            # Get schemas with better error handling
+            try:
+                schemas = db_inspector.get_schema_names()
+                logger.info(f"Found {len(schemas)} schemas in database {db_name}: {schemas}")
+            except Exception as e:
+                logger.warning(f"Could not get schema names for {db_name}: {e}")
+                schemas = ['dbo']  # Default schema
+            
             db_schema = {
                 'name': db_name,
                 'schemas': [],
                 'extraction_time': datetime.utcnow().isoformat()
             }
             
+            # Process each schema
             for schema_name in schemas:
-                schema_data = await self._extract_schema_tables(db_inspector, schema_name)
-                if schema_data['tables']:  # Only include schemas with tables
-                    db_schema['schemas'].append(schema_data)
+                try:
+                    logger.info(f"Processing schema: {db_name}.{schema_name}")
+                    schema_data = await self._extract_schema_tables(db_inspector, schema_name, db_name)
+                    if schema_data and (schema_data['tables'] or schema_data['views']):  # Include schemas with tables or views
+                        db_schema['schemas'].append(schema_data)
+                        logger.info(f"Successfully processed schema {schema_name} with {len(schema_data['tables'])} tables and {len(schema_data['views'])} views")
+                    else:
+                        logger.info(f"Schema {schema_name} has no tables or views, skipping")
+                except Exception as e:
+                    logger.error(f"Error processing schema {db_name}.{schema_name}: {e}")
+                    continue
+            
+            # Close the database-specific engine
+            db_engine.dispose()
             
             return db_schema
             
@@ -76,43 +126,96 @@ class SchemaExtractor:
             logger.error(f"Error extracting database {db_name}: {e}")
             return None
     
-    async def _extract_schema_tables(self, inspector, schema_name: str) -> Dict[str, Any]:
+    async def _extract_schema_tables(self, inspector, schema_name: str, db_name: str) -> Dict[str, Any]:
         """Extract tables and metadata for a schema"""
-        tables = inspector.get_table_names(schema=schema_name)
-        views = inspector.get_view_names(schema=schema_name)
-        
-        schema_data = {
-            'name': schema_name,
-            'tables': [],
-            'views': []
-        }
-        
-        # Process tables
-        for table_name in tables:
-            table_data = await self._extract_table_metadata(inspector, table_name, schema_name, 'table')
-            schema_data['tables'].append(table_data)
-        
-        # Process views
-        for view_name in views:
-            view_data = await self._extract_table_metadata(inspector, view_name, schema_name, 'view')
-            schema_data['views'].append(view_data)
-        
-        return schema_data
+        try:
+            # Use error handling for table/view discovery
+            try:
+                tables = inspector.get_table_names(schema=schema_name)
+            except Exception as e:
+                logger.warning(f"Could not get tables for {db_name}.{schema_name}: {e}")
+                tables = []
+            
+            try:
+                views = inspector.get_view_names(schema=schema_name)
+            except Exception as e:
+                logger.warning(f"Could not get views for {db_name}.{schema_name}: {e}")
+                views = []
+            
+            logger.info(f"Schema {schema_name}: {len(tables)} tables, {len(views)} views")
+            
+            schema_data = {
+                'name': schema_name,
+                'tables': [],
+                'views': []
+            }
+            
+            # Process tables with progress logging
+            for i, table_name in enumerate(tables):
+                if i % 10 == 0:  # Log progress every 10 tables
+                    logger.info(f"Processing table {i+1}/{len(tables)} in {db_name}.{schema_name}")
+                
+                table_data = await self._extract_table_metadata(inspector, table_name, schema_name, 'table', db_name)
+                if table_data:
+                    schema_data['tables'].append(table_data)
+            
+            # Process views
+            for i, view_name in enumerate(views):
+                if i % 10 == 0:  # Log progress every 10 views
+                    logger.info(f"Processing view {i+1}/{len(views)} in {db_name}.{schema_name}")
+                
+                view_data = await self._extract_table_metadata(inspector, view_name, schema_name, 'view', db_name)
+                if view_data:
+                    schema_data['views'].append(view_data)
+            
+            return schema_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting schema tables for {db_name}.{schema_name}: {e}")
+            return {
+                'name': schema_name,
+                'tables': [],
+                'views': [],
+                'error': str(e)
+            }
     
-    async def _extract_table_metadata(self, inspector, table_name: str, schema_name: str, object_type: str) -> Dict[str, Any]:
+    async def _extract_table_metadata(self, inspector, table_name: str, schema_name: str, object_type: str, db_name: str) -> Dict[str, Any]:
         """Extract detailed metadata for a table/view"""
         try:
-            columns = inspector.get_columns(table_name, schema=schema_name)
-            pk_constraint = inspector.get_pk_constraint(table_name, schema=schema_name)
-            foreign_keys = inspector.get_foreign_keys(table_name, schema=schema_name)
-            indexes = inspector.get_indexes(table_name, schema=schema_name)
+            # Get basic table info with error handling
+            try:
+                columns = inspector.get_columns(table_name, schema=schema_name)
+            except Exception as e:
+                logger.warning(f"Could not get columns for {db_name}.{schema_name}.{table_name}: {e}")
+                columns = []
             
-            # Get row count (approximation)
-            row_count = await self._get_row_count(inspector.bind, table_name, schema_name)
+            try:
+                pk_constraint = inspector.get_pk_constraint(table_name, schema=schema_name)
+            except Exception as e:
+                logger.warning(f"Could not get PK for {db_name}.{schema_name}.{table_name}: {e}")
+                pk_constraint = {}
+            
+            try:
+                foreign_keys = inspector.get_foreign_keys(table_name, schema=schema_name)
+            except Exception as e:
+                logger.warning(f"Could not get FKs for {db_name}.{schema_name}.{table_name}: {e}")
+                foreign_keys = []
+            
+            try:
+                indexes = inspector.get_indexes(table_name, schema=schema_name)
+            except Exception as e:
+                logger.warning(f"Could not get indexes for {db_name}.{schema_name}.{table_name}: {e}")
+                indexes = []
+            
+            # Get row count (approximation) - skip for views or if it takes too long
+            row_count = None
+            if object_type == 'table':
+                row_count = await self._get_row_count(inspector.bind, table_name, schema_name)
             
             table_data = {
                 'name': table_name,
                 'schema': schema_name,
+                'database': db_name,
                 'type': object_type,
                 'columns': [
                     {
@@ -149,25 +252,45 @@ class SchemaExtractor:
             return table_data
             
         except Exception as e:
-            logger.error(f"Error extracting metadata for {schema_name}.{table_name}: {e}")
+            logger.error(f"Error extracting metadata for {db_name}.{schema_name}.{table_name}: {e}")
             return {
                 'name': table_name,
                 'schema': schema_name,
+                'database': db_name,
                 'type': object_type,
                 'columns': [],
                 'error': str(e)
             }
     
     async def _get_row_count(self, engine, table_name: str, schema_name: str) -> Optional[int]:
-        """Get approximate row count for table"""
+        """Get approximate row count for table using sys.dm_db_partition_stats for better performance"""
         try:
             with engine.connect() as conn:
-                query = f"SELECT COUNT(*) FROM [{schema_name}].[{table_name}]"
-                result = conn.execute(query)
-                return result.scalar()
+                # Use system DMV for faster row count estimation
+                query = text("""
+                    SELECT SUM(row_count) 
+                    FROM sys.dm_db_partition_stats ps
+                    INNER JOIN sys.objects o ON ps.object_id = o.object_id
+                    INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+                    WHERE s.name = :schema_name 
+                    AND o.name = :table_name 
+                    AND ps.index_id IN (0, 1)
+                """)
+                result = conn.execute(query, {"schema_name": schema_name, "table_name": table_name})
+                row_count = result.scalar()
+                return row_count if row_count is not None else 0
         except Exception as e:
             logger.debug(f"Could not get row count for {schema_name}.{table_name}: {e}")
-            return None
+            # Fallback to COUNT(*) but with timeout
+            try:
+                with engine.connect() as conn:
+                    query = text(f"SELECT COUNT(*) FROM [{schema_name}].[{table_name}]")
+                    # Set a timeout for the query (5 seconds)
+                    result = conn.execute(query.execution_options(timeout=5))
+                    return result.scalar()
+            except Exception as e2:
+                logger.debug(f"Fallback row count also failed for {schema_name}.{table_name}: {e2}")
+                return None
     
     def _generate_schema_hash(self, schema_data: Dict[str, Any]) -> str:
         """Generate hash for change detection"""
@@ -185,11 +308,16 @@ class SchemaExtractor:
         
         with self.neo4j_driver.session() as session:
             # Clear existing schema data (for MVP - in production, do incremental updates)
-            session.run("MATCH (n:Database)-[*]-() DETACH DELETE n")
+            logger.info("Clearing existing data...")
+            session.run("MATCH (n:Database) DETACH DELETE n")
+            session.run("MATCH (n:Schema) DETACH DELETE n")
+            session.run("MATCH (n:Table) DETACH DELETE n")
+            session.run("MATCH (n:Column) DETACH DELETE n")
             
             # Load databases
             for db_data in schema_data['databases']:
                 await self._load_database(session, db_data)
+                logger.info(f"Loaded database: {db_data['name']}")
     
     async def _load_database(self, session, db_data: Dict[str, Any]):
         """Load database and its schemas to Neo4j"""
@@ -207,7 +335,7 @@ class SchemaExtractor:
     
     async def _load_schema(self, session, db_name: str, schema_data: Dict[str, Any]):
         """Load schema and its objects to Neo4j"""
-        # Create schema node
+        # Create schema node and relationship
         session.run("""
             MATCH (db:Database {name: $db_name})
             CREATE (schema:Schema {name: $schema_name})
@@ -224,14 +352,16 @@ class SchemaExtractor:
     
     async def _load_table(self, session, db_name: str, schema_name: str, table_data: Dict[str, Any]):
         """Load table/view and its columns to Neo4j"""
-        # Create table/view node
+        # Create table/view node with proper relationship chain
         session.run("""
-            MATCH (schema:Schema {name: $schema_name})-[:BELONGS_TO]->(db:Database {name: $db_name})
+            MATCH (db:Database {name: $db_name})-[:CONTAINS]->(schema:Schema {name: $schema_name})
             CREATE (table:Table {
                 name: $table_name,
                 type: $table_type,
                 row_count: $row_count,
-                last_analyzed: $last_analyzed
+                last_analyzed: $last_analyzed,
+                database: $db_name,
+                schema: $schema_name
             })
             CREATE (schema)-[:CONTAINS]->(table)
         """, 
@@ -245,7 +375,7 @@ class SchemaExtractor:
         # Load columns
         for col_data in table_data.get('columns', []):
             session.run("""
-                MATCH (table:Table {name: $table_name})-[:BELONGS_TO*2]->(db:Database {name: $db_name})
+                MATCH (db:Database {name: $db_name})-[:CONTAINS]->(schema:Schema {name: $schema_name})-[:CONTAINS]->(table:Table {name: $table_name})
                 CREATE (col:Column {
                     name: $col_name,
                     type: $col_type,
@@ -256,6 +386,7 @@ class SchemaExtractor:
                 CREATE (table)-[:HAS_COLUMN]->(col)
             """,
             db_name=db_name,
+            schema_name=schema_name,
             table_name=table_data['name'],
             col_name=col_data['name'],
             col_type=col_data['type'],
@@ -271,18 +402,21 @@ class SchemaExtractor:
         """Create foreign key relationships in Neo4j"""
         ref_schema = fk_data.get('referred_schema', schema_name)
         
+        # More robust query for foreign key relationships
         session.run("""
-            MATCH (source_table:Table {name: $source_table})-[:BELONGS_TO*2]->(db:Database {name: $db_name})
-            MATCH (target_table:Table {name: $target_table})-[:BELONGS_TO]->(target_schema:Schema {name: $ref_schema})-[:BELONGS_TO]->(db)
+            MATCH (db:Database {name: $db_name})
+            MATCH (db)-[:CONTAINS]->(source_schema:Schema {name: $schema_name})-[:CONTAINS]->(source_table:Table {name: $source_table})
+            MATCH (db)-[:CONTAINS]->(target_schema:Schema {name: $ref_schema})-[:CONTAINS]->(target_table:Table {name: $target_table})
             CREATE (source_table)-[:REFERENCES {
                 constrained_columns: $constrained_columns,
                 referred_columns: $referred_columns
             }]->(target_table)
         """,
         db_name=db_name,
+        schema_name=schema_name,
         source_table=table_name,
-        target_table=fk_data['referred_table'],
         ref_schema=ref_schema,
+        target_table=fk_data['referred_table'],
         constrained_columns=fk_data['constrained_columns'],
         referred_columns=fk_data['referred_columns'])
     
@@ -290,6 +424,8 @@ class SchemaExtractor:
         """Close database connections"""
         if hasattr(self, 'neo4j_driver'):
             self.neo4j_driver.close()
+        if hasattr(self, 'sql_engine'):
+            self.sql_engine.dispose()
 
 
 # Usage example
