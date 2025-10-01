@@ -223,6 +223,68 @@ def create_lineage_graph(lineage_data):
     
     return fig
 
+def refresh_incremental(force_all=False):
+    """Trigger incremental schema refresh"""
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/refresh-schema/incremental",
+            params={"force_all": force_all}
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to refresh schema: {e}")
+        return None
+
+def refresh_database(database):
+    """Trigger database refresh"""
+    try:
+        response = requests.post(f"{API_BASE_URL}/refresh-schema/database/{database}")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to refresh database: {e}")
+        return None
+
+def refresh_schema_specific(database, schema):
+    """Trigger schema refresh"""
+    try:
+        response = requests.post(f"{API_BASE_URL}/refresh-schema/database/{database}/schema/{schema}")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to refresh schema: {e}")
+        return None
+
+def refresh_table_specific(database, schema, table):
+    """Trigger table refresh"""
+    try:
+        response = requests.post(f"{API_BASE_URL}/refresh-schema/database/{database}/schema/{schema}/table/{table}")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to refresh table: {e}")
+        return None
+
+@st.cache_data(ttl=60)
+def check_schema_changes(database=None, schema=None, table=None):
+    """Check which tables need refresh"""
+    try:
+        params = {}
+        if database:
+            params["database"] = database
+        if schema:
+            params["schema"] = schema
+        if table:
+            params["table"] = table
+        
+        response = requests.get(f"{API_BASE_URL}/refresh-schema/check-changes", params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Failed to check schema changes: {e}")
+        return None
+
 # Main application
 def main():
     st.title("🗃️ Data Catalog")
@@ -276,12 +338,14 @@ def main():
         
         with col2:
             st.subheader("Quick Actions")
-            if st.button("🔄 Refresh Schema", width='stretch'):
-                with st.spinner("Refreshing schema..."):
-                    result = refresh_schema()
-                    if result:
-                        st.success("Schema refresh initiated!")
-                        st.cache_data.clear()
+            # NO NO NO NO NO NO NO (oh Mama Mia, Mama Mia, Mama Mia, let me go)
+            # if st.button("🔄 Refresh Schema", width='stretch'):
+            #     with st.spinner("Refreshing schema..."):
+            #         result = refresh_schema()
+            #         if result:
+            #             st.success("Schema refresh initiated!")
+            #             st.cache_data.clear()
+            # BEELZEBUB HAS A FUNCTION PUT ASIDE FOR ME, FOR ME, FOR MEEEEE
             
             if st.button("📦 Create Data Product", width='stretch'):
                 st.session_state.page = "📦 Data Products"
@@ -491,6 +555,46 @@ def main():
                     st.subheader("Related Data Products")
                     for dp in table_details["data_products"]:
                         st.write(f"• {dp}")
+
+                # Table metadata section
+                if table_details.get("last_analyzed"):
+                    st.markdown("---")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown("**Last Analyzed:**")
+                        last_analyzed = pd.to_datetime(table_details["last_analyzed"])
+                        st.write(last_analyzed.strftime('%Y-%m-%d %H:%M:%S'))
+                    
+                    with col2:
+                        # Check if table needs refresh
+                        if st.button("🔍 Check for Changes", key="check_changes_btn"):
+                            with st.spinner("Checking for schema changes..."):
+                                changes = check_schema_changes(
+                                    database=selected_database,
+                                    schema=selected_schema,
+                                    table=selected_table
+                                )
+                                
+                                if changes and changes.get("tables_needing_refresh"):
+                                    table_status = changes["tables_needing_refresh"][0]
+                                    if table_status["needs_refresh"]:
+                                        st.warning(f"⚠️ Table has changed! {table_status['reason']}")
+                                    else:
+                                        st.success("✅ Table is up to date")
+                                else:
+                                    st.success("✅ Table is up to date")
+                    
+                    with col3:
+                        # Refresh this table
+                        if st.button("🔄 Refresh This Table", key="refresh_table_btn"):
+                            with st.spinner(f"Refreshing {selected_database}.{selected_schema}.{selected_table}..."):
+                                result = refresh_table_specific(selected_database, selected_schema, selected_table)
+                                if result:
+                                    st.success("Table refresh initiated! Reload this page in a few moments.")
+                                    st.cache_data.clear()
+                
+                st.markdown("---")
                 
                 # Quick actions
                 col1, col2 = st.columns(2)
@@ -629,40 +733,277 @@ def main():
     elif page == "⚙️ Admin":
         st.header("Administration")
         
-        col1, col2 = st.columns(2)
+        tab1, tab2, tab3 = st.tabs(["🔄 Schema Refresh", "📊 Change Detection", "⚙️ System"])
         
-        with col1:
-            st.subheader("Schema Management")
+        with tab1:
+            st.subheader("Schema Refresh Options")
             
-            if st.button("🔄 Refresh Schema Now"):
-                with st.spinner("Refreshing schema..."):
-                    result = refresh_schema()
-                    if result:
-                        st.success("Schema refresh initiated!")
-                        st.cache_data.clear()
+            col1, col2 = st.columns(2)
             
-            st.info("Schema is automatically refreshed daily at 2:00 AM")
-        
-        with col2:
-            st.subheader("Cache Management")
+            with col1:
+                st.markdown("### Full Refresh")
+                st.info("Refreshes all databases, schemas, and tables. This can take a long time.")
+                
+                if st.button("🔄 Full Schema Refresh", type="primary", use_container_width=True):
+                    with st.spinner("Initiating full schema refresh..."):
+                        result = refresh_schema()
+                        if result:
+                            st.success("Full schema refresh initiated! This will run in the background.")
+                            st.cache_data.clear()
             
-            if st.button("🗑️ Clear Cache"):
-                st.cache_data.clear()
-                st.success("Cache cleared!")
+            with col2:
+                st.markdown("### Incremental Refresh (Smart)")
+                st.info("Only refreshes tables that have changed since last analysis. Much faster!")
+                
+                if st.button("🔄 Incremental Refresh", type="primary", use_container_width=True):
+                    with st.spinner("Initiating incremental refresh..."):
+                        result = refresh_incremental(force_all=False)
+                        if result:
+                            st.success("Incremental refresh initiated! Only changed tables will be updated.")
+                            st.cache_data.clear()
+            
+            st.markdown("---")
+            
+            # Selective refresh
+            st.subheader("Selective Refresh")
+            st.markdown("Refresh specific databases, schemas, or tables")
+            
+            refresh_type = st.radio(
+                "Select what to refresh:",
+                ["Database", "Schema", "Table"],
+                horizontal=True
+            )
+            
+            if refresh_type == "Database":
+                databases = get_databases()
+                if databases:
+                    selected_db = st.selectbox("Select Database", databases)
+                    
+                    if st.button(f"🔄 Refresh Database: {selected_db}", use_container_width=True):
+                        with st.spinner(f"Refreshing database {selected_db}..."):
+                            result = refresh_database(selected_db)
+                            if result:
+                                st.success(result.get("message", "Database refresh initiated!"))
+                                st.cache_data.clear()
+            
+            elif refresh_type == "Schema":
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    databases = get_databases()
+                    if databases:
+                        selected_db = st.selectbox("Select Database", databases, key="schema_refresh_db")
+                
+                with col2:
+                    if selected_db:
+                        schemas = get_schemas(selected_db)
+                        if schemas:
+                            selected_schema = st.selectbox("Select Schema", schemas)
+                        else:
+                            st.warning("No schemas found")
+                            selected_schema = None
+                    else:
+                        selected_schema = None
+                
+                if selected_db and selected_schema:
+                    if st.button(f"🔄 Refresh Schema: {selected_db}.{selected_schema}", use_container_width=True):
+                        with st.spinner(f"Refreshing schema {selected_db}.{selected_schema}..."):
+                            result = refresh_schema_specific(selected_db, selected_schema)
+                            if result:
+                                st.success(result.get("message", "Schema refresh initiated!"))
+                                st.cache_data.clear()
+            
+            elif refresh_type == "Table":
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    databases = get_databases()
+                    if databases:
+                        selected_db = st.selectbox("Select Database", databases, key="table_refresh_db")
+                
+                with col2:
+                    if selected_db:
+                        schemas = get_schemas(selected_db)
+                        if schemas:
+                            selected_schema = st.selectbox("Select Schema", schemas, key="table_refresh_schema")
+                        else:
+                            st.warning("No schemas found")
+                            selected_schema = None
+                    else:
+                        selected_schema = None
+                
+                with col3:
+                    if selected_db and selected_schema:
+                        tables_data = get_tables(selected_db, selected_schema)
+                        if tables_data:
+                            tables = [t["name"] for t in tables_data]
+                            selected_table = st.selectbox("Select Table", tables)
+                        else:
+                            st.warning("No tables found")
+                            selected_table = None
+                    else:
+                        selected_table = None
+                
+                if selected_db and selected_schema and selected_table:
+                    if st.button(f"🔄 Refresh Table: {selected_db}.{selected_schema}.{selected_table}", use_container_width=True):
+                        with st.spinner(f"Refreshing table {selected_db}.{selected_schema}.{selected_table}..."):
+                            result = refresh_table_specific(selected_db, selected_schema, selected_table)
+                            if result:
+                                st.success(result.get("message", "Table refresh initiated!"))
+                                st.cache_data.clear()
         
-        # System status
-        st.subheader("System Status")
+        with tab2:
+            st.subheader("Schema Change Detection")
+            st.markdown("Check which tables have changed since last analysis")
+            
+            # Filter options
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                databases = get_databases()
+                filter_db = st.selectbox("Filter by Database", ["All"] + databases, key="change_detect_db")
+                if filter_db == "All":
+                    filter_db = None
+            
+            with col2:
+                if filter_db:
+                    schemas = get_schemas(filter_db)
+                    filter_schema = st.selectbox("Filter by Schema", ["All"] + schemas, key="change_detect_schema")
+                    if filter_schema == "All":
+                        filter_schema = None
+                else:
+                    filter_schema = None
+                    st.selectbox("Filter by Schema", ["All"], disabled=True)
+            
+            with col3:
+                if filter_db and filter_schema:
+                    tables_data = get_tables(filter_db, filter_schema)
+                    tables = [t["name"] for t in tables_data]
+                    filter_table = st.selectbox("Filter by Table", ["All"] + tables, key="change_detect_table")
+                    if filter_table == "All":
+                        filter_table = None
+                else:
+                    filter_table = None
+                    st.selectbox("Filter by Table", ["All"], disabled=True)
+            
+            if st.button("🔍 Check for Changes", use_container_width=True):
+                with st.spinner("Checking for schema changes..."):
+                    changes = check_schema_changes(
+                        database=filter_db,
+                        schema=filter_schema,
+                        table=filter_table
+                    )
+                
+                if changes:
+                    # Summary metrics
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Total Tables", changes["total_tables"])
+                    with col2:
+                        st.metric("Need Refresh", changes["needs_refresh"], 
+                                 delta=f"{changes['needs_refresh']} changes")
+                    with col3:
+                        st.metric("Up to Date", changes["up_to_date"])
+                    
+                    st.markdown("---")
+                    
+                    # Tables needing refresh
+                    if changes["tables_needing_refresh"]:
+                        st.subheader("⚠️ Tables Needing Refresh")
+                        
+                        needs_refresh_df = pd.DataFrame(changes["tables_needing_refresh"])
+                        
+                        # Format datetime columns
+                        for col in ["last_analyzed", "last_modified"]:
+                            if col in needs_refresh_df.columns:
+                                needs_refresh_df[col] = pd.to_datetime(needs_refresh_df[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        st.dataframe(
+                            needs_refresh_df[[
+                                "database", "schema", "table", 
+                                "last_analyzed", "last_modified", "reason"
+                            ]],
+                            use_container_width=True
+                        )
+                        
+                        # Bulk refresh option
+                        if st.button("🔄 Refresh All Tables Shown Above", type="primary", use_container_width=True):
+                            with st.spinner("Initiating refresh for changed tables..."):
+                                result = refresh_incremental(force_all=False)
+                                if result:
+                                    st.success("Refresh initiated for all changed tables!")
+                                    st.cache_data.clear()
+                    else:
+                        st.success("✅ All tables are up to date!")
+                    
+                    # Show up-to-date tables in expander
+                    if changes["tables_up_to_date"]:
+                        with st.expander(f"✅ Up-to-Date Tables ({len(changes['tables_up_to_date'])})"):
+                            up_to_date_df = pd.DataFrame(changes["tables_up_to_date"])
+                            
+                            # Format datetime columns
+                            for col in ["last_analyzed", "last_modified"]:
+                                if col in up_to_date_df.columns:
+                                    up_to_date_df[col] = pd.to_datetime(up_to_date_df[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            st.dataframe(
+                                up_to_date_df[[
+                                    "database", "schema", "table", 
+                                    "last_analyzed", "last_modified"
+                                ]],
+                                use_container_width=True
+                            )
         
-        try:
-            response = requests.get(f"{API_BASE_URL}/health")
-            if response.status_code == 200:
-                st.success("✅ API is healthy")
-                health_data = response.json()
-                st.json(health_data)
-            else:
-                st.error("❌ API is not responding correctly")
-        except:
-            st.error("❌ Cannot connect to API")
+        with tab3:
+            st.subheader("System Management")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### Scheduled Refresh")
+                st.info("Schema is automatically refreshed daily at 2:00 AM (incremental refresh)")
+                
+                if st.button("⏱️ View Schedule"):
+                    st.code("""
+Scheduled Jobs:
+- Incremental Refresh: Daily at 2:00 AM
+- Full Refresh: Manual only
+                    """)
+            
+            with col2:
+                st.markdown("### Cache Management")
+                st.info("Clear cached data to force fresh queries")
+                
+                if st.button("🗑️ Clear Cache", use_container_width=True):
+                    st.cache_data.clear()
+                    st.success("Cache cleared!")
+            
+            st.markdown("---")
+            
+            # System status
+            st.subheader("System Status")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                try:
+                    response = requests.get(f"{API_BASE_URL}/health")
+                    if response.status_code == 200:
+                        st.success("✅ API is healthy")
+                        health_data = response.json()
+                        st.json(health_data)
+                    else:
+                        st.error("❌ API is not responding correctly")
+                except:
+                    st.error("❌ Cannot connect to API")
+            
+            with col2:
+                stats = get_catalog_stats()
+                if stats:
+                    st.markdown("**Catalog Statistics:**")
+                    for key, value in stats.items():
+                        st.metric(key.replace("_", " ").title(), value)
 
 if __name__ == "__main__":
     main()
